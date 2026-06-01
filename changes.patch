@@ -1,0 +1,229 @@
+diff --git a/apps/desktop/src/routes/editor/TranscriptPage.tsx b/apps/desktop/src/routes/editor/TranscriptPage.tsx
+index 1c903efe..539aa439 100644
+--- a/apps/desktop/src/routes/editor/TranscriptPage.tsx
++++ b/apps/desktop/src/routes/editor/TranscriptPage.tsx
+@@ -35,6 +35,11 @@ interface FlatWord {
+	end: number;
+	segmentIndex: number;
+	wordIndex: number;
++	deleted?: boolean;
++	bufferStart?: number;
++	bufferEnd?: number;
++	isPause?: boolean;
++	isFiller?: boolean;
+ }
+
+ interface TranscriptSegmentGroup {
+@@ -67,23 +72,58 @@ export function TranscriptPanel() {
+	const allWords = createMemo((): FlatWord[] => {
+		const segments = project.captions?.segments ?? [];
+		const result: FlatWord[] = [];
++		const FILLER_WORDS = ['uh', 'um', 'ah', 'er', 'hmm', 'mhm'];
++
++		let lastEnd = 0;
++		let pauseWordIndex = 0;
++
+		for (let segIdx = 0; segIdx < segments.length; segIdx++) {
+			const seg = segments[segIdx];
+			const words = seg.words ?? [];
+			for (let wordIdx = 0; wordIdx < words.length; wordIdx++) {
+				const w = words[wordIdx];
++
++				// Detect pause
++				const gap = w.start - lastEnd;
++				if (gap >= 0.5) {
++					result.push({
++						text: `[Pause ${gap.toFixed(1)}s]`,
++						start: lastEnd,
++						end: w.start,
++						segmentIndex: -1, // Use -1 to indicate it's not a real word in the DB, it's a gap
++						wordIndex: pauseWordIndex++,
++						isPause: true,
++						deleted: false,
++						bufferStart: 0.15,
++						bufferEnd: 0.15,
++					});
++				}
++
++				const normalizedWord = w.text.trim().toLowerCase().replace(/[^a-z]/g, '');
++				const isFiller = FILLER_WORDS.includes(normalizedWord);
++
+				result.push({
+					text: w.text,
+					start: w.start,
+					end: w.end,
+					segmentIndex: segIdx,
+					wordIndex: wordIdx,
++					deleted: w.deleted ?? false,
++					bufferStart: w.bufferStart,
++					bufferEnd: w.bufferEnd,
++					isFiller,
+				});
++
++				lastEnd = w.end;
+			}
+		}
+		return result;
+	});
+
++	// State for auto-clean popover
++	const [showAutoCleanPopover, setShowAutoCleanPopover] = createSignal(false);
++	const [silenceThreshold, setSilenceThreshold] = createSignal(1.5);
++
+	const segmentGroups = createMemo((): TranscriptSegmentGroup[] => {
+		const words = allWords();
+		const groups: TranscriptSegmentGroup[] = [];
+@@ -159,7 +199,10 @@ export function TranscriptPanel() {
+		});
+
+		const timeRanges = wordsToDelete
+-			.map((w) => ({ start: w.start, end: w.end }))
++			.map((w) => ({
++				start: w.start - (w.bufferStart ?? 0),
++				end: w.end + (w.bufferEnd ?? 0)
++			}))
+			.sort((a, b) => a.start - b.start);
+
+		const mergedRanges: { start: number; end: number }[] = [];
+@@ -238,6 +281,56 @@ export function TranscriptPanel() {
+		applyWordDeletions(flatIndices);
+	};
+
++	const handleAutoClean = () => {
++		const words = allWords();
++		const indicesToDelete: number[] = [];
++		const threshold = silenceThreshold();
++
++		for (let i = 0; i < words.length; i++) {
++			const w = words[i];
++			if (w.deleted) continue;
++
++			if (w.isFiller) {
++				indicesToDelete.push(i);
++			} else if (w.isPause && (w.end - w.start) >= threshold) {
++				indicesToDelete.push(i);
++			}
++		}
++
++		if (indicesToDelete.length > 0) {
++			applyWordDeletions(indicesToDelete);
++		}
++		setShowAutoCleanPopover(false);
++	};
++
++	const handleUpdateBuffer = (flatIndex: number, startBuffer: number, endBuffer: number) => {
++		const words = allWords();
++		const word = words[flatIndex];
++		if (!word) return;
++
++		setProject(
++			produce((p) => {
++				if (!p.captions?.segments) return;
++				const seg = p.captions.segments[word.segmentIndex];
++				if (seg?.words) {
++					seg.words[word.wordIndex].bufferStart = startBuffer;
++					seg.words[word.wordIndex].bufferEnd = endBuffer;
++				}
++			})
++		);
++		setEditorState("captions", "isStale", false);
++
++		// If the word is already deleted, we should ideally re-apply the cut with the new buffers.
++		// For simplicity, we can just call applyWordDeletions again on it so that it updates the cut.
++		if (word.deleted) {
++			// First restore to clear the old cut, then delete to apply the new cut
++			applyWordRestorations([flatIndex]);
++			setTimeout(() => {
++				applyWordDeletions([flatIndex]);
++			}, 50);
++		}
++	};
++
+	const isAtEnd = () => {
+		const total = totalDuration();
+		return total > 0 && total - editorState.playbackTime <= 0.1;
+@@ -293,9 +386,60 @@ export function TranscriptPanel() {
+
+	return (
+		<div class="flex flex-col min-h-0 h-full">
+-			<div class="px-3 py-2 border-b border-gray-3 flex items-center justify-between shrink-0">
++			<div class="px-3 py-2 border-b border-gray-3 flex items-center justify-between shrink-0 relative">
+				<span class="text-xs font-medium text-gray-12">Transcript</span>
+				<div class="flex items-center gap-1">
++					<div class="relative flex items-center mr-2">
++						<button
++							type="button"
++							class="flex items-center justify-center h-5 px-2 rounded-l-sm bg-blue-9 text-white hover:bg-blue-10 transition-colors disabled:opacity-30 disabled:pointer-events-none text-xs"
++							disabled={allWords().length === 0}
++							onClick={handleAutoClean}
++							title="Auto-Clean: Remove filler words & silences"
++						>
++							Auto-Clean
++						</button>
++						<button
++							type="button"
++							class="flex items-center justify-center w-5 h-5 rounded-r-sm bg-blue-9 text-white border-l border-blue-11 hover:bg-blue-10 transition-colors disabled:opacity-30 disabled:pointer-events-none"
++							disabled={allWords().length === 0}
++							onClick={(e) => {
++								e.stopPropagation();
++								setShowAutoCleanPopover(!showAutoCleanPopover());
++							}}
++							title="Auto-Clean settings"
++						>
++							<IconLucideChevronDown class="size-3" />
++						</button>
++						<Show when={showAutoCleanPopover()}>
++							<div class="absolute right-0 top-full mt-1 bg-gray-12 border border-gray-3 rounded-md shadow-lg z-50 p-3 w-64 text-xs flex flex-col gap-3">
++								<h4 class="font-medium text-gray-1 mb-1">Auto-Clean Settings</h4>
++								<div class="flex flex-col gap-1">
++									<label class="text-gray-9 flex justify-between">
++										<span>Silence Threshold:</span>
++										<span class="text-gray-1">{silenceThreshold().toFixed(1)}s</span>
++									</label>
++									<input
++										type="range"
++										min="0.1"
++										max="5.0"
++										step="0.1"
++										class="w-full"
++										value={silenceThreshold()}
++										onInput={(e) => setSilenceThreshold(parseFloat(e.target.value))}
++									/>
++									<p class="text-gray-9 mt-1 text-[10px]">Silences longer than this will be removed.</p>
++								</div>
++								<button
++									type="button"
++									class="bg-blue-9 text-white rounded-md py-1.5 w-full font-medium hover:bg-blue-10 mt-1"
++									onClick={handleAutoClean}
++								>
++									Apply
++								</button>
++							</div>
++						</Show>
++					</div>
+					<button
+						type="button"
+						class="flex items-center justify-center size-5 rounded-sm hover:bg-gray-3 text-gray-9 hover:text-gray-12 transition-colors disabled:opacity-30 disabled:pointer-events-none"
+@@ -328,6 +472,7 @@ export function TranscriptPanel() {
+				onWordClick={handleWordClick}
+				onDeleteWord={handleDeleteWord}
+				onDeleteWords={handleDeleteWords}
++				onUpdateBuffer={handleUpdateBuffer}
+			/>
+		</div>
+	);
+diff --git a/packages/sdk-recorder/src/index.ts b/packages/sdk-recorder/src/index.ts
+index 0f7eb10e..ddc70889 100644
+--- a/packages/sdk-recorder/src/index.ts
++++ b/packages/sdk-recorder/src/index.ts
+@@ -82,9 +82,9 @@ export class CapRecorder {
+			this.listeners.set(event, new Set());
+		}
+		const set = this.listeners.get(event);
+-		if (set) set.add(handler as EventHandler<keyof RecorderEventMap>);
++		if (set) set.add(handler as any);
+		return () => {
+-			this.listeners.get(event)?.delete(handler);
++			this.listeners.get(event)?.delete(handler as any);
+		};
+	}
