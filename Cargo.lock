@@ -1298,6 +1298,7 @@ dependencies = [
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
+ "ort",
  "parakeet-rs",
  "png 0.17.16",
  "pollster",
