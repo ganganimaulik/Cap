@@ -204,7 +204,6 @@ export function CaptionsTab(props: {
 	const downloadProgress = () => editorState.captions.downloadProgress;
 	const setDownloadProgress = (value: number) =>
 		setEditorState("captions", "downloadProgress", value);
-	const downloadingModel = () => editorState.captions.downloadingModel;
 	const setDownloadingModel = (value: string | null) =>
 		setEditorState("captions", "downloadingModel", value);
 	const isGenerating = () => editorState.captions.isGenerating;
@@ -288,37 +287,11 @@ export function CaptionsTab(props: {
 				setHasAudio(hasAudioTrack);
 			}
 
-			const downloadState = localStorage.getItem("modelDownloadState");
-			if (downloadState) {
-				const { model, progress } = JSON.parse(downloadState);
-				if (model && progress < 100) {
-					setDownloadingModel(model);
-					setDownloadProgress(progress);
-					setIsDownloading(true);
-				} else {
-					localStorage.removeItem("modelDownloadState");
-				}
-			}
+			localStorage.removeItem("modelDownloadState");
 		} catch (error) {
 			console.error("Error checking models:", error);
 		}
 	});
-
-	createEffect(
-		on(
-			() => [isDownloading(), downloadingModel(), downloadProgress()] as const,
-			([downloading, model, progress]) => {
-				if (downloading && model) {
-					localStorage.setItem(
-						"modelDownloadState",
-						JSON.stringify({ model, progress }),
-					);
-				} else {
-					localStorage.removeItem("modelDownloadState");
-				}
-			},
-		),
-	);
 
 	createEffect(
 		on(

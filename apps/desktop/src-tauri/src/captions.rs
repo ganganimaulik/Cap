@@ -25,7 +25,7 @@ use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextPar
 
 pub use cap_project::{CaptionSegment, CaptionSettings, CaptionWord};
 
-use crate::{general_settings::GeneralSettingsStore, http_client};
+use crate::general_settings::GeneralSettingsStore;
 
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
 const PARAKEET_UNSUPPORTED_MESSAGE: &str = "Parakeet transcription is not available on Intel macOS";
@@ -824,9 +824,7 @@ fn process_with_whisper(
                         let text = current_word.trim().to_string();
                         word_end = cap_word_end(&text, ws, word_end);
 
-                        log::info!(
-                            "    -> Completing word: '{text}' ({ws:.2}s - {word_end:.2}s)"
-                        );
+                        log::info!("    -> Completing word: '{text}' ({ws:.2}s - {word_end:.2}s)");
                         words.push(CaptionWord {
                             text,
                             start: ws,
@@ -856,9 +854,7 @@ fn process_with_whisper(
         {
             let text = current_word.trim().to_string();
             word_end = cap_word_end(&text, ws, word_end);
-            log::info!(
-                "    -> Final word: '{text}' ({ws:.2}s - {word_end:.2}s)"
-            );
+            log::info!("    -> Final word: '{text}' ({ws:.2}s - {word_end:.2}s)");
             words.push(CaptionWord {
                 text,
                 start: ws,
@@ -958,11 +954,77 @@ fn build_initial_prompt(transcription_hints: &[String]) -> Option<String> {
     }
 }
 
+#[cfg(all(target_os = "macos", not(target_arch = "x86_64")))]
+fn onnx_runtime_candidates() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(exe_dir) = exe.parent() {
+            candidates.push(exe_dir.join("libonnxruntime.dylib"));
+
+            if let Some(contents_dir) = exe_dir.parent() {
+                candidates.push(
+                    contents_dir
+                        .join("Resources")
+                        .join("onnxruntime")
+                        .join("lib")
+                        .join("libonnxruntime.dylib"),
+                );
+            }
+        }
+    }
+
+    candidates.push(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/native-deps/onnxruntime/lib/libonnxruntime.dylib"),
+    );
+
+    candidates
+}
+
+#[cfg(all(target_os = "macos", not(target_arch = "x86_64")))]
+fn init_onnx_runtime() -> Result<(), String> {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    let mut init_err = None;
+
+    ONCE.call_once(|| {
+        let path = std::env::var_os("ORT_DYLIB_PATH")
+            .map(PathBuf::from)
+            .or_else(|| {
+                onnx_runtime_candidates()
+                    .into_iter()
+                    .find(|path| path.exists())
+            });
+
+        if let Some(path) = path {
+            tracing::info!("Initializing ONNX Runtime from: {}", path.display());
+            match ort::init_from(&path) {
+                Ok(builder) => {
+                    builder.commit();
+                }
+                Err(e) => {
+                    init_err = Some(format!("Failed to initialize ONNX Runtime: {e}"));
+                }
+            }
+        } else {
+            init_err = Some("Failed to find macOS ONNX Runtime dylib".to_string());
+        }
+    });
+
+    if let Some(err) = init_err {
+        return Err(err);
+    }
+    Ok(())
+}
+
 #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
 fn process_with_parakeet(
     audio_path: &std::path::Path,
     model_dir: &str,
 ) -> Result<CaptionData, String> {
+    #[cfg(target_os = "macos")]
+    init_onnx_runtime()?;
+
     tracing::info!("Processing audio file: {audio_path:?}");
     tracing::info!("Model directory: {model_dir}");
 
@@ -1668,7 +1730,10 @@ pub async fn download_whisper_model(
             .map_err(|e| format!("Failed to create parent directories: {e}"))?;
     }
 
-    let http_client = app.state::<http_client::HttpClient>();
+    let http_client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("Failed to create http client: {e}"))?;
     let total_size = total_content_length(&http_client, model_parts).await;
 
     let mut file = tokio::fs::File::create(&validated_path)
@@ -1867,7 +1932,10 @@ pub async fn download_parakeet_model(app: AppHandle, output_dir: String) -> Resu
     std::fs::create_dir_all(&staging_dir)
         .map_err(|e| format!("Failed to create staging directory: {e}"))?;
 
-    let http_client = app.state::<http_client::HttpClient>();
+    let http_client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("Failed to create http client: {e}"))?;
     let model_files = parakeet_model_files_for_dir(&validated_dir);
 
     let mut total_size: u64 = 0;

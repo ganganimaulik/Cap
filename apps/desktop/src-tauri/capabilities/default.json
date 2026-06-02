@@ -11,11 +11,14 @@
 		"fs:read-all",
 		"fs:allow-appdata-read",
 		"fs:allow-appdata-write",
+		"fs:allow-applocaldata-read",
+		"fs:allow-applocaldata-write",
 		"fs:allow-picture-read-recursive",
 		{
 			"identifier": "fs:scope",
 			"allow": [
 				{ "path": "$APPDATA/**" },
+				{ "path": "$APPLOCALDATA/**" },
 				{ "path": "$HOME/**" },
 				{ "path": "$RESOURCE/**" }
 			]

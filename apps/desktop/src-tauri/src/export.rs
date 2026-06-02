@@ -971,9 +971,8 @@ pub async fn export_video_with_id(
 
 #[tauri::command]
 #[specta::specta]
-#[instrument(skip(app, window, progress, editor))]
+#[instrument(skip(window, progress, editor))]
 pub async fn export_video_to_file(
-    app: tauri::AppHandle,
     window: tauri::Window,
     project_path: PathBuf,
     progress: tauri::ipc::Channel<FramesRendered>,
@@ -983,6 +982,7 @@ pub async fn export_video_to_file(
     editor: OptionalWindowEditorInstance,
 ) -> Result<PathBuf, String> {
     let window_label = window.label().to_string();
+    let app = tauri::Manager::app_handle(&window).clone();
     match AssertUnwindSafe(async move {
         let cancellation_guard = ExportCancellationGuard::new(
             next_export_command_id("export-to-file"),
@@ -993,8 +993,7 @@ pub async fn export_video_to_file(
             project_path,
             progress,
             settings,
-            file_name,
-            file_type,
+            (&file_name, &file_type),
             editor,
             cancellation_guard.token(),
         )
@@ -1013,13 +1012,13 @@ async fn export_video_to_file_inner(
     project_path: PathBuf,
     progress: tauri::ipc::Channel<FramesRendered>,
     settings: ExportSettings,
-    file_name: String,
-    file_type: String,
+    file_info: (&str, &str),
     editor: OptionalWindowEditorInstance,
     cancel_token: CancellationToken,
 ) -> Result<PathBuf, String> {
+    let (file_name, file_type) = file_info;
     let _session_guard = ExportSessionGuard::new();
-    let Some(save_path) = show_export_save_dialog(&app, file_name, file_type).await? else {
+    let Some(save_path) = show_export_save_dialog(&app, file_name.to_string(), file_type.to_string()).await? else {
         return Err("Save dialog cancelled".to_string());
     };
 
