@@ -10,6 +10,7 @@ import {
 	commands,
 	type SegmentRecordings,
 	type TimelineSegment,
+	type TranscriptionEngine,
 } from "~/utils/tauri";
 import type { CaptionWordExtended } from "./caption-types";
 import { isFillerWord } from "./filler-detection";
@@ -29,6 +30,9 @@ export function resolveCaptionModel(model: string | null | undefined) {
 		: DEFAULT_WHISPER_CAPTION_MODEL;
 
 	if (!model) return fallbackModel;
+	if (model === "modal-crisper-whisper") {
+		return model;
+	}
 	if (!supportsParakeetTranscription() && PARAKEET_DIR_MODELS.has(model)) {
 		return DEFAULT_WHISPER_CAPTION_MODEL;
 	}
@@ -309,9 +313,14 @@ export async function transcribeEditorCaptions(
 ): Promise<CaptionData> {
 	const resolvedModelName = resolveCaptionModel(modelName);
 	const modelPath = await getModelPath(resolvedModelName);
-	const engine = PARAKEET_DIR_MODELS.has(resolvedModelName)
-		? "Parakeet"
-		: "Whisper";
+	let engine: TranscriptionEngine;
+	if (resolvedModelName === "modal-crisper-whisper") {
+		engine = "ModalCrisperWhisper";
+	} else if (PARAKEET_DIR_MODELS.has(resolvedModelName)) {
+		engine = "Parakeet";
+	} else {
+		engine = "Whisper";
+	}
 	return await commands.transcribeAudio(videoPath, modelPath, language, engine);
 }
 

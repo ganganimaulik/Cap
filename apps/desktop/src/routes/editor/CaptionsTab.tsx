@@ -85,6 +85,13 @@ const MODEL_OPTIONS: ModelOption[] = [
 		description: "Larger download, higher accuracy",
 	},
 	{
+		name: "modal-crisper-whisper",
+		label: "CrisperWhisper (Modal.com)",
+		modelName: "CrisperWhisper (Cloud)",
+		size: "Cloud",
+		description: "Run in the cloud via modal.com",
+	},
+	{
 		name: "small",
 		modelName: "whisper.cpp small",
 		label: "Small",
@@ -315,6 +322,9 @@ export function CaptionsTab(props: {
 	);
 
 	const checkModelExists = async (modelName: string) => {
+		if (modelName === "modal-crisper-whisper") {
+			return true;
+		}
 		if (PARAKEET_DIR_MODELS.has(modelName)) {
 			const modelPath = await getModelPath(modelName);
 			return await commands.checkParakeetModelExists(modelPath);
@@ -328,6 +338,9 @@ export function CaptionsTab(props: {
 	const downloadModel = async () => {
 		try {
 			const modelToDownload = selectedModel();
+			if (modelToDownload === "modal-crisper-whisper") {
+				return;
+			}
 			setIsDownloading(true);
 			setDownloadProgress(0);
 			setDownloadingModel(modelToDownload);

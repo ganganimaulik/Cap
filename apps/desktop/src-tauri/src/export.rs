@@ -1018,7 +1018,9 @@ async fn export_video_to_file_inner(
 ) -> Result<PathBuf, String> {
     let (file_name, file_type) = file_info;
     let _session_guard = ExportSessionGuard::new();
-    let Some(save_path) = show_export_save_dialog(&app, file_name.to_string(), file_type.to_string()).await? else {
+    let Some(save_path) =
+        show_export_save_dialog(&app, file_name.to_string(), file_type.to_string()).await?
+    else {
         return Err("Save dialog cancelled".to_string());
     };
 

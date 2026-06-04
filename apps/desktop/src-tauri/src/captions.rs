@@ -34,6 +34,7 @@ const PARAKEET_UNSUPPORTED_MESSAGE: &str = "Parakeet transcription is not availa
 pub enum TranscriptionEngine {
     Whisper,
     Parakeet,
+    ModalCrisperWhisper,
 }
 
 #[derive(Debug, Serialize, Deserialize, Type, Clone)]
@@ -1125,6 +1126,101 @@ fn process_with_parakeet(
     Err(PARAKEET_UNSUPPORTED_MESSAGE.to_string())
 }
 
+fn find_modal_executable() -> std::path::PathBuf {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let candidates = [
+        format!("{home}/.pyenv/shims/modal"),
+        format!("{home}/.local/bin/modal"),
+        "/opt/homebrew/bin/modal".to_string(),
+        "/usr/local/bin/modal".to_string(),
+    ];
+    for candidate in &candidates {
+        let path = std::path::PathBuf::from(candidate);
+        if path.exists() {
+            return path;
+        }
+    }
+    std::path::PathBuf::from("modal")
+}
+
+async fn process_with_modal(
+    app: &AppHandle,
+    audio_path: &std::path::Path,
+    model_type: &str,
+) -> Result<CaptionData, String> {
+    let script_path = app
+        .path()
+        .resolve(
+            "resources/modal_transcribe.py",
+            tauri::path::BaseDirectory::Resource,
+        )
+        .map_err(|e| format!("Failed to resolve Modal script path: {e}"))?;
+
+    let script_content = std::fs::read(&script_path)
+        .map_err(|e| format!("Failed to read Modal script content: {e}"))?;
+
+    // Copy the script to a temporary directory outside the macOS bundle because Python/Modal's
+    // import resolver raises NotADirectoryError when executing a script inside a `.app` bundle.
+    let temp_dir =
+        tempdir().map_err(|e| format!("Failed to create temporary directory for script: {e}"))?;
+    let temp_script_path = temp_dir.path().join("modal_transcribe.py");
+    std::fs::write(&temp_script_path, script_content)
+        .map_err(|e| format!("Failed to write Modal script to temporary file: {e}"))?;
+
+    let modal_path = find_modal_executable();
+
+    let output = tokio::process::Command::new(&modal_path)
+        .arg("run")
+        .arg(&temp_script_path)
+        .arg("--audio-path")
+        .arg(audio_path)
+        .arg("--model-type")
+        .arg(model_type)
+        .output()
+        .await
+        .map_err(|e| format!("Failed to run modal CLI: {e}"))?;
+
+    let stdout_str = String::from_utf8_lossy(&output.stdout);
+    let stderr_str = String::from_utf8_lossy(&output.stderr);
+
+    if !output.status.success() {
+        tracing::error!(
+            "Modal execution failed.\nStdout: {}\nStderr: {}",
+            stdout_str,
+            stderr_str
+        );
+        return Err(format!(
+            "Modal transcription failed.\nStdout: {}\nStderr: {}",
+            stdout_str, stderr_str
+        ));
+    }
+
+    let mut caption_data: Option<CaptionData> = None;
+    for line in stdout_str.lines() {
+        if line.trim().starts_with('{') {
+            if let Ok(data) = serde_json::from_str::<serde_json::Value>(line) {
+                if data.get("segments").is_some() {
+                    if let Ok(parsed) = serde_json::from_value::<CaptionData>(data) {
+                        caption_data = Some(parsed);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    match caption_data {
+        Some(mut data) => {
+            data.settings = Some(cap_project::CaptionSettings::default());
+            Ok(data)
+        }
+        None => {
+            tracing::error!("No JSON output found. Stdout: {}", stdout_str);
+            Err("No valid transcription output found in Modal response".to_string())
+        }
+    }
+}
+
 #[tauri::command]
 #[specta::specta]
 #[instrument]
@@ -1140,19 +1236,23 @@ pub async fn transcribe_audio(
     log::info!("Model path: {}", model_path);
     log::info!("Language: {}", language);
 
-    let validated_model_path = validate_model_path(&app, &model_path)?;
+    let is_cloud_model = matches!(engine, TranscriptionEngine::ModalCrisperWhisper);
+
+    let model_path = if is_cloud_model {
+        model_path
+    } else {
+        let validated_model_path = validate_model_path(&app, &model_path)?;
+        if !validated_model_path.exists() {
+            log::error!("Model file not found at path: {model_path}");
+            return Err(format!("Model file not found at path: {model_path}"));
+        }
+        validated_model_path.to_string_lossy().to_string()
+    };
 
     if !std::path::Path::new(&video_path).exists() {
         log::error!("Video file not found at path: {video_path}");
         return Err(format!("Video file not found at path: {video_path}"));
     }
-
-    if !validated_model_path.exists() {
-        log::error!("Model file not found at path: {model_path}");
-        return Err(format!("Model file not found at path: {model_path}"));
-    }
-
-    let model_path = validated_model_path.to_string_lossy().to_string();
 
     let temp_dir = tempdir().map_err(|e| format!("Failed to create temporary directory: {e}"))?;
     let audio_path = temp_dir.path().join("audio.wav");
@@ -1181,6 +1281,10 @@ pub async fn transcribe_audio(
     }
 
     let transcription_result = match engine {
+        TranscriptionEngine::ModalCrisperWhisper => {
+            log::info!("Using Modal CrisperWhisper engine");
+            process_with_modal(&app, &audio_path, "crisper-whisper").await
+        }
         TranscriptionEngine::Parakeet => {
             log::info!("Using Parakeet TDT engine");
             let model_dir = model_path.clone();
