@@ -340,6 +340,9 @@ async saveModelFile(path: string, data: number[]) : Promise<null> {
 async transcribeAudio(videoPath: string, modelPath: string, language: string, engine: TranscriptionEngine) : Promise<CaptionData> {
     return await TAURI_INVOKE("transcribe_audio", { videoPath, modelPath, language, engine });
 },
+async extractAudioForTranscription(videoPath: string) : Promise<string> {
+    return await TAURI_INVOKE("extract_audio_for_transcription", { videoPath });
+},
 async saveCaptions(videoId: string, captions: CaptionData) : Promise<null> {
     return await TAURI_INVOKE("save_captions", { videoId, captions });
 },

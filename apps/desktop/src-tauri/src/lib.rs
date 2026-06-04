@@ -4248,6 +4248,7 @@ pub async fn run(recording_logging_handle: LoggingHandle, logs_dir: PathBuf) {
             captions::create_dir,
             captions::save_model_file,
             captions::transcribe_audio,
+            captions::extract_audio_for_transcription,
             captions::save_captions,
             captions::load_captions,
             captions::download_whisper_model,

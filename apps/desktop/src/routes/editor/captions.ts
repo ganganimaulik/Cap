@@ -1,7 +1,9 @@
 import { appLocalDataDir, join } from "@tauri-apps/api/path";
+import { readFile, remove } from "@tauri-apps/plugin-fs";
 import { arch, type as osType } from "@tauri-apps/plugin-os";
 
 import { defaultCaptionSettings } from "~/store/captions";
+import { clientEnv } from "~/utils/env";
 import {
 	type CaptionData,
 	type CaptionSegment,
@@ -306,17 +308,124 @@ export async function getModelPath(modelName: string): Promise<string> {
 	return await join(base, `${modelName}.bin`);
 }
 
+async function transcribeWithModal(videoPath: string): Promise<CaptionData> {
+	const modalUrl = clientEnv.VITE_MODAL_CRISPER_URL;
+	if (!modalUrl) {
+		throw new Error(
+			"Modal transcription URL is not configured. Please set VITE_MODAL_CRISPER_URL in your .env file.",
+		);
+	}
+
+	const wavPath = await commands.extractAudioForTranscription(videoPath);
+
+	try {
+		const audioBytes = await readFile(wavPath);
+
+		const response = await fetch(modalUrl, {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/octet-stream",
+			},
+			body: audioBytes,
+		});
+
+		if (!response.ok) {
+			throw new Error(
+				`Failed to transcribe via Modal: ${response.statusText} (${response.status})`,
+			);
+		}
+
+		const reader = response.body?.getReader();
+		if (!reader) {
+			throw new Error("Response body is empty.");
+		}
+
+		const decoder = new TextDecoder();
+		let currentBuffer = "";
+		let finalResult: {
+			chunks: {
+				text: string;
+				timestamp: [number, number];
+			}[];
+		} | null = null;
+
+		while (true) {
+			const { done, value } = await reader.read();
+			if (done) break;
+
+			currentBuffer += decoder.decode(value, { stream: true });
+			const lines = currentBuffer.split("\n");
+			currentBuffer = lines.pop() ?? "";
+
+			for (const line of lines) {
+				if (!line.trim()) continue;
+				const msg = JSON.parse(line);
+				if (msg.error) {
+					throw new Error(msg.error);
+				} else if (msg.result) {
+					finalResult = msg.result;
+				}
+			}
+		}
+
+		if (!finalResult || !finalResult.chunks) {
+			throw new Error("No transcription result returned from CrisperWhisper.");
+		}
+
+		const words: CaptionWord[] = [];
+		for (const chunk of finalResult.chunks) {
+			const start = Math.max(0, chunk.timestamp[0] - 0.15);
+			const end = chunk.timestamp[1] || chunk.timestamp[0] + 0.5;
+
+			words.push({
+				text: chunk.text.trim(),
+				start,
+				end,
+			});
+		}
+
+		const segments: CaptionSegment[] = [];
+		const maxWords = 6;
+		for (let i = 0; i < words.length; i += maxWords) {
+			const chunk = words.slice(i, i + maxWords);
+			const segmentText = chunk.map((w) => w.text).join(" ");
+			const segmentStart = chunk[0]?.start ?? 0.0;
+			const segmentEnd = chunk[chunk.length - 1]?.end ?? 0.0;
+
+			segments.push({
+				id: `segment-${i / maxWords}`,
+				start: segmentStart,
+				end: segmentEnd,
+				text: segmentText,
+				words: chunk,
+			});
+		}
+
+		return {
+			segments,
+			settings: null,
+		};
+	} finally {
+		try {
+			await remove(wavPath);
+		} catch (e) {
+			console.warn("Failed to delete temp audio file:", e);
+		}
+	}
+}
+
 export async function transcribeEditorCaptions(
 	videoPath: string,
 	modelName = DEFAULT_CAPTION_MODEL,
 	language = DEFAULT_CAPTION_LANGUAGE,
 ): Promise<CaptionData> {
 	const resolvedModelName = resolveCaptionModel(modelName);
+	if (resolvedModelName === "modal-crisper-whisper") {
+		return await transcribeWithModal(videoPath);
+	}
 	const modelPath = await getModelPath(resolvedModelName);
 	let engine: TranscriptionEngine;
-	if (resolvedModelName === "modal-crisper-whisper") {
-		engine = "ModalCrisperWhisper";
-	} else if (PARAKEET_DIR_MODELS.has(resolvedModelName)) {
+	if (PARAKEET_DIR_MODELS.has(resolvedModelName)) {
 		engine = "Parakeet";
 	} else {
 		engine = "Whisper";

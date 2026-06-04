@@ -53,8 +53,7 @@
 			"assets/backgrounds/dark/*": "assets/backgrounds/dark/",
 			"assets/backgrounds/orange/*": "assets/backgrounds/orange/",
 			"assets/backgrounds/purple/*": "assets/backgrounds/purple/",
-			"../src/assets/rive/*.riv": "assets/rive/",
-			"resources/modal_transcribe.py": "resources/modal_transcribe.py"
+			"../src/assets/rive/*.riv": "assets/rive/"
 		},
 		"macOS": {
 			"dmg": {
