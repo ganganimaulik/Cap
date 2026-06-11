@@ -309,37 +309,22 @@ fn sample_texture(uv: vec2<f32>, crop_bounds_uv: vec4<f32>) -> vec4<f32> {
 
         if is_downscaling {
             let texel_size = 1.0 / uniforms.frame_size;
+            let clamped_ratio = min(scale_ratio, vec2<f32>(8.0));
+            let half_extent = clamped_ratio * 0.5 * texel_size;
 
-            let offset_x = vec2<f32>(texel_size.x, 0.0);
-            let offset_y = vec2<f32>(0.0, texel_size.y);
+            var accum = vec3<f32>(0.0);
+            for (var iy = -2; iy <= 2; iy++) {
+                for (var ix = -2; ix <= 2; ix++) {
+                    let offset = vec2<f32>(
+                        f32(ix) / 2.0 * half_extent.x,
+                        f32(iy) / 2.0 * half_extent.y
+                    );
+                    let sample_uv = clamp(cropped_uv + offset, safe_min, safe_max);
+                    accum += textureSample(frame_texture, frame_sampler, sample_uv).rgb;
+                }
+            }
 
-            let left = textureSample(
-                frame_texture,
-                frame_sampler,
-                clamp(cropped_uv - offset_x, safe_min, safe_max)
-            ).rgb;
-            let right = textureSample(
-                frame_texture,
-                frame_sampler,
-                clamp(cropped_uv + offset_x, safe_min, safe_max)
-            ).rgb;
-            let top = textureSample(
-                frame_texture,
-                frame_sampler,
-                clamp(cropped_uv - offset_y, safe_min, safe_max)
-            ).rgb;
-            let bottom = textureSample(
-                frame_texture,
-                frame_sampler,
-                clamp(cropped_uv + offset_y, safe_min, safe_max)
-            ).rgb;
-
-            let blurred = (left + right + top + bottom) * 0.25;
-
-            let sharpness = min(scale_ratio.x * 0.3, 0.7);
-            let sharpened = center_color + (center_color - blurred) * sharpness;
-
-            return vec4(clamp(sharpened, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
+            return vec4(accum / 25.0, 1.0);
         }
 
         if is_upscaling {
