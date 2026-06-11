@@ -308,7 +308,10 @@ fn sample_texture(uv: vec2<f32>, crop_bounds_uv: vec4<f32>) -> vec4<f32> {
         let center_color = textureSample(frame_texture, frame_sampler, cropped_uv).rgb;
 
         if is_downscaling {
-            let texel_size = 1.0 / uniforms.frame_size;
+            // When downscaling, use a box filter based on the downscaling ratio to avoid aliasing.
+            // We adjust the sample distance proportionally to how much we are shrinking the image.
+            let sample_dist = max(scale_ratio.x, scale_ratio.y) * 0.5;
+            let texel_size = (1.0 / uniforms.frame_size) * sample_dist;
 
             let offset_x = vec2<f32>(texel_size.x, 0.0);
             let offset_y = vec2<f32>(0.0, texel_size.y);
@@ -333,13 +336,31 @@ fn sample_texture(uv: vec2<f32>, crop_bounds_uv: vec4<f32>) -> vec4<f32> {
                 frame_sampler,
                 clamp(cropped_uv + offset_y, safe_min, safe_max)
             ).rgb;
+            let top_left = textureSample(
+                frame_texture,
+                frame_sampler,
+                clamp(cropped_uv - offset_x - offset_y, safe_min, safe_max)
+            ).rgb;
+            let top_right = textureSample(
+                frame_texture,
+                frame_sampler,
+                clamp(cropped_uv + offset_x - offset_y, safe_min, safe_max)
+            ).rgb;
+            let bottom_left = textureSample(
+                frame_texture,
+                frame_sampler,
+                clamp(cropped_uv - offset_x + offset_y, safe_min, safe_max)
+            ).rgb;
+            let bottom_right = textureSample(
+                frame_texture,
+                frame_sampler,
+                clamp(cropped_uv + offset_x + offset_y, safe_min, safe_max)
+            ).rgb;
 
-            let blurred = (left + right + top + bottom) * 0.25;
+            // Average center with the surrounding 8 samples
+            let blurred = (center_color + left + right + top + bottom + top_left + top_right + bottom_left + bottom_right) / 9.0;
 
-            let sharpness = min(scale_ratio.x * 0.3, 0.7);
-            let sharpened = center_color + (center_color - blurred) * sharpness;
-
-            return vec4(clamp(sharpened, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
+            return vec4(clamp(blurred, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
         }
 
         if is_upscaling {
