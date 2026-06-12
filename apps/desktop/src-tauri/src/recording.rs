@@ -80,6 +80,7 @@ fn recording_stopped_share_url(link: &str) -> String {
     }
 }
 
+const CURRENT_DESKTOP_BACKGROUND_BASENAME: &str = "current-desktop-background";
 const CURRENT_DESKTOP_BACKGROUND_FILENAME: &str = "current-desktop-background.jpg";
 const CURRENT_DESKTOP_BACKGROUND_PENDING_FILENAME: &str = "current-desktop-background.pending.jpg";
 
@@ -123,44 +124,111 @@ async fn store_current_desktop_background_snapshot(
     recording_dir: PathBuf,
     capture_target: ScreenCaptureTarget,
 ) -> Result<PathBuf, String> {
+    let display_id = capture_target
+        .display()
+        .map(|display| display.id().to_string());
+
     tokio::task::spawn_blocking(move || {
         let output_path = current_desktop_background_snapshot_path(&recording_dir);
         let pending_path = pending_current_desktop_background_snapshot_path(&recording_dir);
-        let display_id = capture_target
-            .display()
-            .map(|display| display.id().to_string());
-        let source_path = current_desktop_background_source_path(display_id.as_deref())
-            .ok_or_else(|| "Current desktop background path not found".to_string())?;
-
-        if !source_path.exists() {
-            return Err(format!(
-                "Current desktop background does not exist: {}",
-                source_path.display()
-            ));
-        }
-
-        if let Some(parent) = output_path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|err| format!("Failed to create background assets directory: {err}"))?;
-        }
-
-        let _ = std::fs::remove_file(&pending_path);
-        if let Err(error) = write_desktop_background_snapshot(&source_path, &pending_path) {
-            let _ = std::fs::remove_file(&pending_path);
-            return Err(error);
-        }
-
-        if output_path.exists() {
-            std::fs::remove_file(&output_path)
-                .map_err(|err| format!("Failed to replace current desktop background: {err}"))?;
-        }
-
-        std::fs::rename(&pending_path, &output_path)
-            .map_err(|err| format!("Failed to store current desktop background: {err}"))?;
+        write_current_desktop_background_to(
+            &output_path,
+            &pending_path,
+            display_id.as_deref(),
+            true,
+        )?;
         Ok(output_path)
     })
     .await
     .map_err(|err| format!("Desktop background snapshot task failed: {err}"))?
+}
+
+#[tauri::command]
+#[specta::specta]
+#[instrument]
+pub async fn import_current_desktop_background(project_path: String) -> Result<String, String> {
+    let project_dir = PathBuf::from(project_path);
+
+    tokio::task::spawn_blocking(move || {
+        let assets_dir = project_dir.join("assets");
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_millis())
+            .unwrap_or(0);
+        let output_name = format!("{CURRENT_DESKTOP_BACKGROUND_BASENAME}-{timestamp}.jpg");
+        let output_path = assets_dir.join(&output_name);
+        let pending_path = assets_dir.join(format!(
+            "{CURRENT_DESKTOP_BACKGROUND_BASENAME}-{timestamp}.pending.jpg"
+        ));
+
+        write_current_desktop_background_to(&output_path, &pending_path, None, false)?;
+        remove_imported_desktop_background_snapshots(&assets_dir, &output_name);
+
+        Ok(output_path.to_string_lossy().into_owned())
+    })
+    .await
+    .map_err(|err| format!("Desktop background snapshot task failed: {err}"))?
+}
+
+fn remove_imported_desktop_background_snapshots(assets_dir: &Path, keep_name: &str) {
+    let Ok(entries) = std::fs::read_dir(assets_dir) else {
+        return;
+    };
+
+    let prefix = format!("{CURRENT_DESKTOP_BACKGROUND_BASENAME}-");
+    for entry in entries.flatten() {
+        if let Some(name) = entry.file_name().to_str()
+            && name != keep_name
+            && name.starts_with(prefix.as_str())
+        {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+fn write_current_desktop_background_to(
+    output_path: &Path,
+    pending_path: &Path,
+    display_id: Option<&str>,
+    enforce_protected_check: bool,
+) -> Result<(), String> {
+    let source_path = current_desktop_background_source_path(display_id)
+        .ok_or_else(|| "Current desktop background path not found".to_string())?;
+
+    if enforce_protected_check && desktop_background_source_requires_user_prompt(&source_path) {
+        return Err(format!(
+            "Skipping current desktop background from protected location: {}",
+            source_path.display()
+        ));
+    }
+
+    if !source_path.exists() {
+        return Err(format!(
+            "Current desktop background does not exist: {}",
+            source_path.display()
+        ));
+    }
+
+    if let Some(parent) = output_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|err| format!("Failed to create background assets directory: {err}"))?;
+    }
+
+    let _ = std::fs::remove_file(pending_path);
+    if let Err(error) = write_desktop_background_snapshot(&source_path, pending_path) {
+        let _ = std::fs::remove_file(pending_path);
+        return Err(error);
+    }
+
+    if output_path.exists() {
+        std::fs::remove_file(output_path)
+            .map_err(|err| format!("Failed to replace current desktop background: {err}"))?;
+    }
+
+    std::fs::rename(pending_path, output_path)
+        .map_err(|err| format!("Failed to store current desktop background: {err}"))?;
+
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -266,6 +334,37 @@ fn current_desktop_background_source_path(_display_id: Option<&str>) -> Option<P
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn current_desktop_background_source_path(_display_id: Option<&str>) -> Option<PathBuf> {
     None
+}
+
+fn desktop_background_source_requires_user_prompt(source_path: &Path) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        dirs::home_dir().is_some_and(|home_dir| {
+            desktop_background_source_requires_user_prompt_for_home(source_path, &home_dir)
+        })
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = source_path;
+        false
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn desktop_background_source_requires_user_prompt_for_home(
+    source_path: &Path,
+    home_dir: &Path,
+) -> bool {
+    [
+        home_dir.join("Desktop"),
+        home_dir.join("Documents"),
+        home_dir.join("Downloads"),
+        home_dir.join("Library/Mobile Documents"),
+        home_dir.join("Library/CloudStorage"),
+    ]
+    .iter()
+    .any(|protected_dir| source_path.starts_with(protected_dir))
 }
 
 #[cfg(target_os = "macos")]
@@ -584,22 +683,63 @@ pub struct CameraWithFormats {
 }
 
 fn get_best_format(formats: &[CameraFormatInfo]) -> Option<CameraFormatInfo> {
-    formats
+    let preferred_rate = 59.0..=60.0;
+    let supported_rate = 24.0..=60.0;
+
+    let mut ideal_formats = formats
         .iter()
-        .filter(|f| f.frame_rate >= 24.0 && f.frame_rate <= 60.0)
-        .max_by(|a, b| {
-            let res_a = a.width * a.height;
-            let res_b = b.width * b.height;
-            res_a.cmp(&res_b)
-        })
-        .or_else(|| {
-            formats.iter().max_by(|a, b| {
-                let res_a = a.width * a.height;
-                let res_b = b.width * b.height;
-                res_a.cmp(&res_b)
+        .filter(|f| preferred_rate.contains(&f.frame_rate) && f.width <= 1280 && f.height <= 720)
+        .collect::<Vec<_>>();
+
+    if ideal_formats.is_empty() {
+        ideal_formats = formats
+            .iter()
+            .filter(|f| preferred_rate.contains(&f.frame_rate) && f.width < 2000 && f.height < 2000)
+            .collect();
+    }
+
+    if ideal_formats.is_empty() {
+        ideal_formats = formats
+            .iter()
+            .filter(|f| {
+                supported_rate.contains(&f.frame_rate) && f.width <= 1280 && f.height <= 720
             })
-        })
-        .cloned()
+            .collect();
+    }
+
+    if ideal_formats.is_empty() {
+        ideal_formats = formats
+            .iter()
+            .filter(|f| supported_rate.contains(&f.frame_rate) && f.width < 2000 && f.height < 2000)
+            .collect();
+    }
+
+    if ideal_formats.is_empty() {
+        ideal_formats = formats.iter().collect();
+    }
+
+    ideal_formats.sort_by(|a, b| {
+        let target_aspect_ratio = 16.0 / 9.0;
+        let aspect_ratio_a = a.width as f32 / a.height as f32;
+        let aspect_ratio_b = b.width as f32 / b.height as f32;
+        let aspect_cmp_a = (aspect_ratio_a - target_aspect_ratio).abs();
+        let aspect_cmp_b = (aspect_ratio_b - target_aspect_ratio).abs();
+        let resolution_cmp = (a.width * a.height).cmp(&(b.width * b.height));
+        let fr_cmp_a = (a.frame_rate - 60.0).abs();
+        let fr_cmp_b = (b.frame_rate - 60.0).abs();
+
+        aspect_cmp_a
+            .partial_cmp(&aspect_cmp_b)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(resolution_cmp.reverse())
+            .then(
+                fr_cmp_a
+                    .partial_cmp(&fr_cmp_b)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+            )
+    });
+
+    ideal_formats.into_iter().next().cloned()
 }
 
 #[tauri::command(async)]
@@ -754,6 +894,23 @@ pub struct StartRecordingInputs {
     pub mode: RecordingMode,
     #[serde(default)]
     pub organization_id: Option<String>,
+}
+
+fn desktop_recording_defaults(
+    general_settings: Option<&GeneralSettingsStore>,
+) -> cap_recording::RecordingDefaults {
+    match general_settings {
+        Some(settings) => cap_recording::RecordingDefaults {
+            custom_cursor_capture: settings.custom_cursor_capture,
+            capture_keyboard_events: settings.capture_keyboard_events,
+            crash_recovery_recording: settings.crash_recovery_recording,
+            max_fps: settings.max_fps,
+            studio_recording_quality: settings.studio_recording_quality.into(),
+            out_of_process_muxer: settings.out_of_process_muxer,
+            instant_mode_max_resolution: cap_recording::DEFAULT_INSTANT_MODE_MAX_RESOLUTION,
+        },
+        None => cap_recording::RecordingDefaults::default(),
+    }
 }
 
 #[derive(Deserialize, Type, Serialize, Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -1164,58 +1321,62 @@ pub async fn start_recording(
         warn!(%error, "Failed to update camera window content protection");
     }
 
-    let video_upload_info = match inputs.mode {
+    let (video_upload_info, instant_mode_max_resolution) = match inputs.mode {
         RecordingMode::Instant => {
-            match AuthStore::get(&app).ok().flatten() {
-                Some(_) => {
-                    let upload_mode =
-                        if matches!(inputs.capture_target, ScreenCaptureTarget::CameraOnly) {
-                            "desktopMP4"
-                        } else {
-                            "desktopSegments"
-                        };
-
-                    let s3_config = match crate::upload::create_or_get_video_with_mode(
-                        &app,
-                        false,
-                        None,
-                        Some(project_name.clone()),
-                        None,
-                        inputs.organization_id.clone(),
-                        upload_mode,
-                    )
-                    .await
-                    {
-                        Ok(meta) => meta,
-                        Err(AuthedApiError::InvalidAuthentication) => {
-                            return Ok(RecordingAction::InvalidAuthentication);
-                        }
-                        Err(AuthedApiError::UpgradeRequired) => {
-                            return Ok(RecordingAction::UpgradeRequired);
-                        }
-                        Err(err) => {
-                            error!("Error creating instant mode video: {err}");
-                            return Err(err.to_string());
-                        }
-                    };
-
-                    let link = app.make_app_url(format!("/s/{}", s3_config.id)).await;
-                    info!("Pre-created shareable link: {}", link);
-
-                    Some(VideoUploadInfo {
-                        id: s3_config.id.to_string(),
-                        link: link.clone(),
-                        config: s3_config,
+            let Some(auth) = AuthStore::get(&app).ok().flatten() else {
+                return Err("Please sign in to use instant recording".to_string());
+            };
+            let instant_mode_max_resolution = if auth.is_upgraded() {
+                general_settings
+                    .map_or(cap_recording::PRO_INSTANT_MODE_MAX_RESOLUTION, |settings| {
+                        settings.instant_mode_max_resolution
                     })
+            } else {
+                cap_recording::FREE_INSTANT_MODE_MAX_RESOLUTION
+            };
+            let upload_mode = if matches!(inputs.capture_target, ScreenCaptureTarget::CameraOnly) {
+                "desktopMP4"
+            } else {
+                "desktopSegments"
+            };
+
+            let s3_config = match crate::upload::create_or_get_video_with_mode(
+                &app,
+                false,
+                None,
+                Some(project_name.clone()),
+                None,
+                inputs.organization_id.clone(),
+                upload_mode,
+            )
+            .await
+            {
+                Ok(meta) => meta,
+                Err(AuthedApiError::InvalidAuthentication) => {
+                    return Ok(RecordingAction::InvalidAuthentication);
                 }
-                // Allow the recording to proceed without error for any signed-in user
-                _ => {
-                    // User is not signed in
-                    return Err("Please sign in to use instant recording".to_string());
+                Err(AuthedApiError::UpgradeRequired) => {
+                    return Ok(RecordingAction::UpgradeRequired);
                 }
-            }
+                Err(err) => {
+                    error!("Error creating instant mode video: {err}");
+                    return Err(err.to_string());
+                }
+            };
+
+            let link = app.make_app_url(format!("/s/{}", s3_config.id)).await;
+            info!("Pre-created shareable link: {}", link);
+
+            (
+                Some(VideoUploadInfo {
+                    id: s3_config.id.to_string(),
+                    link: link.clone(),
+                    config: s3_config,
+                }),
+                instant_mode_max_resolution,
+            )
         }
-        RecordingMode::Studio => None,
+        RecordingMode::Studio => (None, cap_recording::PRO_INSTANT_MODE_MAX_RESOLUTION),
         RecordingMode::Screenshot => return Err("Use take_screenshot for screenshots".to_string()),
     };
 
@@ -1408,62 +1569,18 @@ pub async fn start_recording(
                         selected_mic_settings,
                     )
                     .await?;
+                    let defaults = desktop_recording_defaults(general_settings.as_ref());
 
                     match inputs.mode {
                         RecordingMode::Studio => {
-                            let max_fps =
-                                general_settings.as_ref().map(|s| s.max_fps).unwrap_or(60);
-                            let max_fps = if camera_feed.is_some() {
-                                max_fps.min(30)
-                            } else {
-                                max_fps
-                            };
-                            let mut builder = studio_recording::Actor::builder(
-                                recording_dir.clone(),
-                                inputs.capture_target.clone(),
-                            )
-                            .with_system_audio(inputs.capture_system_audio)
-                            .with_custom_cursor(
-                                general_settings
-                                    .as_ref()
-                                    .map(|s| s.custom_cursor_capture)
-                                    .unwrap_or_default(),
-                            )
-                            .with_keyboard_capture(
-                                general_settings
-                                    .as_ref()
-                                    .map(|s| s.capture_keyboard_events)
-                                    .unwrap_or(true),
-                            )
-                            .with_fragmented(
-                                general_settings
-                                    .as_ref()
-                                    .map(|s| s.crash_recovery_recording)
-                                    .unwrap_or(true),
-                            )
-                            .with_out_of_process_muxer(
-                                general_settings
-                                    .as_ref()
-                                    .map(|s| s.out_of_process_muxer)
-                                    .unwrap_or(false),
-                            )
-                            .with_max_fps(max_fps)
-                            .with_quality(
-                                match general_settings
-                                    .as_ref()
-                                    .map(|s| s.studio_recording_quality)
-                                    .unwrap_or_default()
-                                {
-                                    crate::general_settings::StudioRecordingQuality::Compatibility => {
-                                        cap_recording::StudioQuality::Compatibility
-                                    }
-                                    crate::general_settings::StudioRecordingQuality::Balanced => {
-                                        cap_recording::StudioQuality::Balanced
-                                    }
-                                    crate::general_settings::StudioRecordingQuality::Ultra => {
-                                        cap_recording::StudioQuality::Ultra
-                                    }
-                                },
+                            let mut builder = defaults.apply_to_studio_builder(
+                                studio_recording::Actor::builder(
+                                    recording_dir.clone(),
+                                    inputs.capture_target.clone(),
+                                )
+                                .with_system_audio(inputs.capture_system_audio),
+                                camera_feed.is_some(),
+                                None,
                             );
 
                             #[cfg(target_os = "macos")]
@@ -1507,12 +1624,7 @@ pub async fn start_recording(
                                 inputs.capture_target.clone(),
                             )
                             .with_system_audio(inputs.capture_system_audio)
-                            .with_max_output_size(
-                                general_settings
-                                    .as_ref()
-                                    .map(|settings| settings.instant_mode_max_resolution)
-                                    .unwrap_or(1920),
-                            );
+                            .with_max_output_size(instant_mode_max_resolution);
 
                             #[cfg(target_os = "macos")]
                             {
@@ -3422,7 +3534,7 @@ async fn emit_recording_started_telemetry(app: &AppHandle, state_mtx: &MutableSt
     use crate::posthog::{PostHogEvent, async_capture_event};
     use crate::recording_telemetry::{mode_label, target_kind_label};
 
-    let (mode, target_kind, has_camera, has_mic, has_system_audio) = {
+    let (mode, recording_mode, target_kind, has_camera, has_mic, has_system_audio) = {
         let state = state_mtx.read().await;
         let Some(recording) = state.current_recording() else {
             return;
@@ -3435,6 +3547,7 @@ async fn emit_recording_started_telemetry(app: &AppHandle, state_mtx: &MutableSt
         };
         (
             mode_label(inputs.mode),
+            inputs.mode,
             target_kind,
             has_camera,
             state.selected_mic_label.is_some(),
@@ -3443,15 +3556,17 @@ async fn emit_recording_started_telemetry(app: &AppHandle, state_mtx: &MutableSt
     };
 
     let general = GeneralSettingsStore::get(app).ok().flatten();
-    let fragmented = general
-        .as_ref()
-        .map(|s| s.crash_recovery_recording)
-        .unwrap_or(true);
-    let custom_cursor_capture = general
-        .as_ref()
-        .map(|s| s.custom_cursor_capture)
-        .unwrap_or(true);
-    let target_fps = general.as_ref().map(|s| s.max_fps).unwrap_or(60);
+    let defaults = desktop_recording_defaults(general.as_ref());
+    let fragmented = defaults.crash_recovery_recording;
+    let custom_cursor_capture = defaults.custom_cursor_capture;
+    // Studio applies the camera fps clamp via `apply_to_studio_builder`; Instant records screen at a
+    // fixed fps, so report the value each mode actually uses rather than the raw studio cap.
+    let target_fps = match recording_mode {
+        RecordingMode::Studio => defaults.studio_max_fps(has_camera, None),
+        RecordingMode::Instant | RecordingMode::Screenshot => {
+            cap_recording::DEFAULT_INSTANT_MODE_FPS
+        }
+    };
 
     async_capture_event(
         app,
@@ -3627,6 +3742,28 @@ mod tests {
         mark_fragmented_recording_for_ffmpeg_export(dir.path()).unwrap();
 
         assert!(fragmented_export_ffmpeg_marker_path(dir.path()).exists());
+    }
+
+    #[test]
+    fn skips_desktop_background_paths_that_can_trigger_macos_prompts() {
+        let home = Path::new("/Users/test");
+
+        assert!(desktop_background_source_requires_user_prompt_for_home(
+            Path::new("/Users/test/Downloads/wallpaper.jpg"),
+            home
+        ));
+        assert!(desktop_background_source_requires_user_prompt_for_home(
+            Path::new("/Users/test/Library/CloudStorage/iCloud Drive/wallpaper.jpg"),
+            home
+        ));
+        assert!(!desktop_background_source_requires_user_prompt_for_home(
+            Path::new("/Users/test/Pictures/wallpaper.jpg"),
+            home
+        ));
+        assert!(!desktop_background_source_requires_user_prompt_for_home(
+            Path::new("/System/Library/Desktop Pictures/wallpaper.jpg"),
+            home
+        ));
     }
 
     #[test]

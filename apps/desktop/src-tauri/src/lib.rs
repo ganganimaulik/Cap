@@ -6,7 +6,11 @@ mod audio_meter;
 mod auth;
 mod camera;
 mod camera_legacy;
+#[cfg(target_os = "macos")]
+mod camera_native;
 mod captions;
+mod cli;
+mod crash_sentinel;
 mod deeplink_actions;
 mod editor_window;
 mod exit_shutdown;
@@ -43,7 +47,7 @@ mod windows;
 
 use audio::AppSounds;
 use auth::{AuthStore, Plan};
-use camera::{CameraPreviewManager, CameraPreviewState};
+use camera::{CameraPreviewManager, CameraPreviewSender, CameraPreviewState};
 use cap_editor::{EditorInstance, EditorState};
 use cap_project::{
     InstantRecordingMeta, ProjectConfiguration, RecordingMeta, RecordingMetaInner, SharingMeta,
@@ -538,7 +542,7 @@ pub struct App {
     #[deprecated = "can be removed when native camera preview is ready"]
     camera_ws_sender: flume::Sender<cap_recording::FFmpegVideoFrame>,
     camera_preview: CameraPreviewManager,
-    camera_blur_tx: tokio::sync::watch::Sender<cap_project::BackgroundBlurMode>,
+    camera_preview_state_tx: tokio::sync::watch::Sender<CameraPreviewState>,
     handle: AppHandle,
     recording_state: RecordingState,
     recording_logging_handle: LoggingHandle,
@@ -654,17 +658,21 @@ async fn remove_camera_preview_sender(
 async fn sync_camera_preview_sender(
     camera_feed: &ActorRef<CameraFeed>,
     camera_ws_sender: flume::Sender<cap_recording::FFmpegVideoFrame>,
-    camera_preview_sender: Option<flume::Sender<cap_recording::FFmpegVideoFrame>>,
+    camera_preview_sender: Option<CameraPreviewSender>,
     use_ws_preview: bool,
 ) {
     if use_ws_preview {
-        if let Some(sender) = camera_preview_sender {
-            remove_camera_preview_sender(camera_feed, sender, "native preview").await;
+        if let Some(sender) = camera_preview_sender
+            && let Err(err) = sender.detach(camera_feed).await
+        {
+            warn!(error = %err, "Failed to remove native preview camera sender");
         }
 
         add_camera_preview_ws_sender(camera_feed, camera_ws_sender).await;
     } else if let Some(sender) = camera_preview_sender {
-        add_camera_preview_sender(camera_feed, sender, "native preview").await;
+        if let Err(err) = sender.attach(camera_feed).await {
+            warn!(error = %err, "Failed to add native preview camera sender");
+        }
         remove_camera_preview_sender(camera_feed, camera_ws_sender, "WebSocket").await;
     } else {
         add_camera_preview_ws_sender(camera_feed, camera_ws_sender).await;
@@ -1253,6 +1261,10 @@ async fn set_native_camera_preview_enabled(
     state: MutableState<'_, App>,
     enabled: bool,
 ) -> Result<(), String> {
+    if enabled && cfg!(not(target_os = "macos")) {
+        return Err("Native camera preview is only available on macOS".to_string());
+    }
+
     let operation_lock = app_handle.state::<CameraWindowOperationLock>();
     let _operation_guard = operation_lock.lock().await;
 
@@ -1771,6 +1783,21 @@ async fn cleanup_app_resources_for_exit(app: &AppHandle) {
     let started = Instant::now();
     log_process_memory_snapshot("exit_cleanup_begin");
 
+    // Reverse the macOS Liquid Glass private SPI (remove the NSGlassEffectView, restore
+    // window/WKWebView occlusion detection) BEFORE anything else, so a slow camera/ML
+    // shutdown can never starve it. Leaving an occlusion-suppressed private glass view
+    // attached when the process hard-exits can wedge WindowServer on macOS 26 and soft-
+    // restart the user's login session. Bounded so a stuck main thread can't block exit.
+    #[cfg(target_os = "macos")]
+    {
+        let _ = await_exit_step(
+            "teardown_liquid_glass",
+            APP_EXIT_STEP_TIMEOUT,
+            crate::platform::teardown_all_liquid_glass(app),
+        )
+        .await;
+    }
+
     export::cancel_all_exports();
     power_observer::uninstall(app);
     fake_window::cancel_all_fake_window_listeners(app);
@@ -1911,6 +1938,11 @@ pub async fn request_app_exit(app: AppHandle) {
             timeout_ms = APP_EXIT_TOTAL_TIMEOUT.as_millis(),
             "Timed out while cleaning up app resources for exit"
         );
+    } else {
+        // Cleanup finished within budget — disarm the sentinel so this graceful exit
+        // is not reported as an unexpected termination on next launch. A timed-out
+        // (hung) shutdown deliberately leaves it armed.
+        crash_sentinel::mark_clean_exit();
     }
 
     finalize_app_exit(&app, 0);
@@ -3537,8 +3569,6 @@ async fn check_upgraded_and_update(app: AppHandle) -> Result<bool, String> {
     }
 
     let Ok(Some(auth)) = AuthStore::get(&app) else {
-        println!("No auth found, clearing auth store");
-        AuthStore::set(&app, None).map_err(|e| e.to_string())?;
         return Ok(false);
     };
 
@@ -3954,13 +3984,13 @@ async fn set_camera_preview_state(
     state: CameraPreviewState,
 ) -> Result<(), String> {
     let app_guard = app.read().await;
-    let blur_mode = state.background_blur;
+    let state_for_ws = state.clone();
     app_guard
         .camera_preview
         .set_state(state)
         .map_err(|err| format!("Error saving camera window state: {err}"))?;
 
-    app_guard.camera_blur_tx.send(blur_mode).ok();
+    let _ = app_guard.camera_preview_state_tx.send(state_for_ws);
     drop(app_guard);
 
     Ok(())
@@ -4012,8 +4042,8 @@ async fn refresh_camera_feed(state: MutableState<'_, App>) -> Result<(), String>
 
     if use_ws_preview {
         if let Some(sender) = camera_preview_sender {
-            camera_feed
-                .ask(feeds::camera::RemoveSender(sender))
+            sender
+                .detach(&camera_feed)
                 .await
                 .map_err(|err| format!("error removing native preview sender: {err}"))?;
         }
@@ -4030,8 +4060,8 @@ async fn refresh_camera_feed(state: MutableState<'_, App>) -> Result<(), String>
             .await
             .map_err(|err| format!("error removing camera ws sender: {err}"))?;
 
-        camera_feed
-            .ask(feeds::camera::AddSender(sender))
+        sender
+            .attach(&camera_feed)
             .await
             .map_err(|err| format!("error re-adding camera preview sender: {err}"))?;
     } else {
@@ -4126,6 +4156,10 @@ type LoggingHandle = tracing_subscriber::reload::Handle<Option<DynLoggingLayer>,
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub async fn run(recording_logging_handle: LoggingHandle, logs_dir: PathBuf) {
+    // Arm the unexpected-termination sentinel before anything else can crash, and
+    // report any previous session that died without a clean shutdown.
+    crash_sentinel::init(&logs_dir, env!("CARGO_PKG_VERSION"));
+
     ffmpeg::init()
         .map_err(|e| {
             error!("Failed to initialize ffmpeg: {e}");
@@ -4144,6 +4178,9 @@ pub async fn run(recording_logging_handle: LoggingHandle, logs_dir: PathBuf) {
             recording_settings::set_recording_mode,
             upload_logs,
             get_system_diagnostics,
+            cli::get_cli_install_status,
+            cli::install_cli,
+            cli::uninstall_cli,
             recording::start_recording,
             recording::stop_recording,
             recording::pause_recording,
@@ -4152,6 +4189,7 @@ pub async fn run(recording_logging_handle: LoggingHandle, logs_dir: PathBuf) {
             recording::restart_recording,
             recording::delete_recording,
             recording::take_screenshot,
+            recording::import_current_desktop_background,
             recording::list_cameras,
             recording::get_camera_formats,
             recording::get_microphone_info,
@@ -4170,6 +4208,7 @@ pub async fn run(recording_logging_handle: LoggingHandle, logs_dir: PathBuf) {
             export::begin_export_session,
             export::end_export_session,
             export::cancel_export,
+            export::cancel_current_window_exports,
             export::export_video,
             export::export_video_with_id,
             export::export_video_to_file,
@@ -4305,17 +4344,17 @@ pub async fn run(recording_logging_handle: LoggingHandle, logs_dir: PathBuf) {
         .typ::<crate::window_exclusion::WindowExclusion>();
 
     #[cfg(debug_assertions)]
-    specta_builder
-        .export(
-            specta_typescript::Typescript::default(),
-            "../src/utils/tauri.ts",
-        )
-        .expect("Failed to export typescript bindings");
+    if let Err(err) = specta_builder.export(
+        specta_typescript::Typescript::default(),
+        "../src/utils/tauri.ts",
+    ) {
+        warn!(error = %err, "Failed to export TypeScript bindings");
+    }
 
-    let (camera_blur_tx, camera_blur_rx) =
-        tokio::sync::watch::channel(cap_project::BackgroundBlurMode::Off);
+    let (camera_preview_state_tx, camera_preview_state_rx) =
+        tokio::sync::watch::channel(CameraPreviewState::default());
     let (camera_tx, camera_ws_port, _shutdown) =
-        camera_legacy::create_camera_preview_ws(camera_blur_rx).await;
+        camera_legacy::create_camera_preview_ws(camera_preview_state_rx).await;
     let camera_ws_sender = camera_tx.clone();
 
     let (mic_samples_tx, mic_samples_rx) = flume::bounded(8);
@@ -4550,7 +4589,7 @@ pub async fn run(recording_logging_handle: LoggingHandle, logs_dir: PathBuf) {
                     camera_ws_sender,
                     handle: app.clone(),
                     camera_preview,
-                    camera_blur_tx,
+                    camera_preview_state_tx,
                     recording_state: RecordingState::None,
                     recording_logging_handle,
                     mic_feed,
@@ -4838,7 +4877,7 @@ pub async fn run(recording_logging_handle: LoggingHandle, logs_dir: PathBuf) {
                     if is_editor_window {
                         export::cancel_exports_for_window(label);
                     }
-                    if export::export_session_active() && !is_editor_window {
+                    if export::export_session_active() {
                         warn!(
                             window = label,
                             "Skipping Destroyed cleanup during active export"
@@ -5243,13 +5282,24 @@ fn handle_run_event(_handle: &AppHandle, event: tauri::RunEvent) {
                     });
                 }
                 ExitRequestDecision::AlreadyExiting => {}
+                ExitRequestDecision::ExportActive => {
+                    warn!("Preventing app exit request during active export");
+                }
                 ExitRequestDecision::AllowRuntimeExit => {}
             }
         }
         tauri::RunEvent::Exit => {
             #[cfg(target_os = "macos")]
             {
-                warn!("macOS runtime exit reached; forcing process exit");
+                // This arm runs on the AppKit main thread, so reverse the Liquid Glass
+                // SPI inline before the hard _exit. This is the last-chance teardown for
+                // terminal paths that skip cleanup_app_resources_for_exit; touching the
+                // NSWindow/NSView here is safe precisely because we are on main.
+                let torn_down = crate::platform::teardown_all_liquid_glass_on_main(_handle);
+                warn!(
+                    windows = torn_down,
+                    "macOS runtime exit reached; tore down liquid glass, forcing process exit"
+                );
                 force_exit(0);
             }
 
