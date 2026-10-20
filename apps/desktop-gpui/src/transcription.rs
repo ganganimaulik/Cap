@@ -18,7 +18,7 @@
 //!   bundle's per-segment mic/system audio to 16kHz mono WAV via ffmpeg, then
 //!   run whisper-rs or parakeet-rs with word timestamps and chunk the words
 //!   into caption segments. `apply_caption_result` is
-//!   `applyCaptionResultToProject` (`captions.ts:469-527`) plus the
+//!   `applyCaptionResultToProject` (`captions.ts:524-591`) plus the
 //!   `deriveCaptionTrackSegments` projection (`captions.ts:323-366`) that the
 //!   Tauri app runs in TypeScript.
 
@@ -1652,6 +1652,10 @@ fn process_with_parakeet(
     if samples.is_empty() {
         return Err("No speech detected in the audio".to_string());
     }
+    let pauses = cap_audio::SpeechPauses::detect(&samples, sample_rate);
+    if pauses.is_none() {
+        tracing::info!("Speech is not clearly above the noise; keeping word ends");
+    }
 
     let mut tokens = Vec::new();
     {
@@ -1678,16 +1682,18 @@ fn process_with_parakeet(
 
     tracing::info!("Parakeet produced {} timed tokens", tokens.len());
 
-    caption_segments_from_tokens(tokens)
+    caption_segments_from_tokens(tokens, pauses.as_ref())
 }
 
 /// Parakeet's timed word tokens -> caption segments: drop empty tokens,
-/// normalize the words and chunk them.
+/// normalize the words, end them where their speech stops in the
+/// transcription audio, and chunk them.
 #[cfg(any(test, not(all(target_os = "macos", target_arch = "x86_64"))))]
 fn caption_segments_from_tokens(
     tokens: impl IntoIterator<Item = CaptionWord>,
+    pauses: Option<&cap_audio::SpeechPauses>,
 ) -> Result<Vec<CaptionSegment>, String> {
-    let words = normalize_caption_words(
+    let mut words = normalize_caption_words(
         tokens
             .into_iter()
             .filter(|token| !token.text.trim().is_empty())
@@ -1698,6 +1704,9 @@ fn caption_segments_from_tokens(
             })
             .collect(),
     );
+    if let Some(pauses) = pauses {
+        end_words_where_speech_stops(&mut words, pauses);
+    }
 
     if words.is_empty() {
         return Err("No speech detected in the audio".to_string());
@@ -1924,6 +1933,23 @@ fn normalize_caption_words(words: Vec<CaptionWord>) -> Vec<CaptionWord> {
     }
 
     normalized
+}
+
+/// `end_words_where_speech_stops` (`captions.rs`).
+#[cfg(any(test, not(all(target_os = "macos", target_arch = "x86_64"))))]
+fn end_words_where_speech_stops(words: &mut [CaptionWord], pauses: &cap_audio::SpeechPauses) {
+    let mut moved = 0;
+    for word in words.iter_mut() {
+        let end = pauses.audible_end(word.start, word.end);
+        if end < word.end {
+            word.end = end;
+            moved += 1;
+        }
+    }
+    tracing::info!(
+        "Ended {moved} of {} words where their speech stops",
+        words.len()
+    );
 }
 
 /// `caption_text_from_words` (`captions.rs:833-849`).
@@ -2182,9 +2208,10 @@ pub fn write_caption_edit_to_source(
     );
 }
 
-/// `applyCaptionResultToProject` (`captions.ts:469-527`): set the captions
+/// `applyCaptionResultToProject` (`captions.ts:524-591`): set the captions
 /// block (enabled, preserving existing style settings), mark it source-timed,
-/// and re-derive the rendered track through the current edit list.
+/// keep the transcript editor's cuts cut, and re-derive the rendered track
+/// through the current edit list.
 pub fn apply_caption_result(
     project: &mut ProjectConfiguration,
     segments: Vec<CaptionSegment>,
@@ -2225,19 +2252,19 @@ pub fn apply_caption_result(
             image_segments: Vec::new(),
         });
     }
+    let captions = project.captions.get_or_insert_with(CaptionsData::default);
+    captions.segments = segments;
+    captions.settings = settings;
+    captions.source_timed = true;
+    cap_project::reconcile_transcript_cuts(captions);
+
     let timeline = project
         .timeline
         .as_mut()
         .expect("timeline was just created");
 
     timeline.caption_segments =
-        derive_caption_track_segments(&segments, timeline, recording_durations);
-
-    project.captions = Some(CaptionsData {
-        segments,
-        settings,
-        source_timed: true,
-    });
+        derive_caption_track_segments(&captions.segments, timeline, recording_durations);
 }
 
 /// `getCaptionGenerationErrorMessage` (`captions.ts:634-662`).
@@ -2474,6 +2501,40 @@ mod tests {
         }
     }
 
+    #[test]
+    fn parakeet_words_end_where_their_speech_stops() {
+        let mut samples = vec![0.0_f32; 16_000 * 5];
+        for (index, sample) in samples.iter_mut().enumerate() {
+            let time = index as f32 / 16_000.0;
+            if (1.0..1.5).contains(&time) || (2.5..3.0).contains(&time) {
+                *sample = 0.1 * (std::f32::consts::TAU * 220.0 * time).sin();
+            }
+        }
+        let pauses = cap_audio::SpeechPauses::detect(&samples, 16_000).expect("speech is audible");
+        let token = |text: &str, start: f32, end: f32| CaptionWord {
+            text: text.to_string(),
+            start,
+            end,
+        };
+
+        let segments = caption_segments_from_tokens(
+            [
+                token(" hello", 1.0, 2.5),
+                token(" world", 2.5, 3.04),
+                token(".", 3.04, 4.2),
+            ],
+            Some(&pauses),
+        )
+        .expect("segments");
+
+        let words = &segments[0].words;
+        assert_eq!(caption_text_from_words(words), "hello world.");
+        assert_eq!((words[0].start, words[1].start), (1.0, 2.5));
+        assert!((words[0].end - 1.6).abs() < 0.02, "{}", words[0].end);
+        assert!((words[1].end - 3.1).abs() < 0.02, "{}", words[1].end);
+        assert_eq!(segments[0].end, words[1].end);
+    }
+
     // -- Model paths ----------------------------------------------------------
 
     #[test]
@@ -2694,6 +2755,7 @@ mod tests {
                 ..CaptionSettings::default()
             },
             source_timed: false,
+            ..Default::default()
         });
 
         apply_caption_result(
@@ -2714,6 +2776,45 @@ mod tests {
         assert_eq!(track.len(), 1);
         assert_eq!(track[0].id, "segment-0-0");
         assert_eq!(track[0].text, "hello");
+    }
+
+    #[test]
+    fn apply_caption_result_keeps_transcript_cuts() {
+        let mut project: ProjectConfiguration = serde_json::from_value(serde_json::json!({
+            "timeline": {
+                "segments": [
+                    { "recordingSegment": 0, "timescale": 1.0, "start": 0.0, "end": 1.6 },
+                    { "recordingSegment": 0, "timescale": 1.0, "start": 1.9, "end": 10.0 }
+                ],
+                "zoomSegments": []
+            },
+            "captions": {
+                "segments": [],
+                "settings": {},
+                "transcriptCuts": [
+                    { "id": "cut", "kind": "word", "text": "um", "start": 1.6, "end": 1.9 }
+                ],
+                "transcriptRemoved": [{ "start": 1.6, "end": 1.9 }]
+            }
+        }))
+        .unwrap();
+
+        apply_caption_result(
+            &mut project,
+            vec![caption(
+                "segment-0-0",
+                1.0,
+                2.5,
+                &[("hello", 1.0, 1.4), ("um", 1.6, 1.9), ("world", 2.0, 2.5)],
+            )],
+            &[10.0],
+            10.0,
+        );
+
+        let captions = project.captions.as_ref().unwrap();
+        assert_eq!(captions.segments[0].text, "hello world");
+        assert_eq!(captions.transcript_cuts.len(), 1);
+        assert_eq!(captions.transcript_removed.len(), 1);
     }
 
     #[test]

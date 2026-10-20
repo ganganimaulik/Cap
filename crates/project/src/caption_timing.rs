@@ -1,5 +1,6 @@
 use crate::{
-    CaptionSegment, CaptionTrackSegment, CaptionWord, ProjectConfiguration, TimelineConfiguration,
+    CaptionSegment, CaptionTrackSegment, CaptionWord, CaptionsData, ProjectConfiguration,
+    TimelineConfiguration, TranscriptCut, TranscriptCutKind,
 };
 use std::collections::HashMap;
 
@@ -369,7 +370,12 @@ pub fn synchronize_captions(project: &mut ProjectConfiguration, recording_durati
     if !captions.source_timed {
         let holds = timeline.hold_windows();
         let mappings = build_source_to_edited_mappings(timeline, recording_durations);
-        let to_source = |output: f64| -> Option<f32> {
+        let output_end = timeline.duration() as f32;
+        let to_source = |output: f32| -> Option<f32> {
+            if output == output_end {
+                return mappings.last().map(|mapping| mapping.source_end as f32);
+            }
+            let output = f64::from(output);
             let effective = output
                 - holds
                     .iter()
@@ -388,16 +394,16 @@ pub fn synchronize_captions(project: &mut ProjectConfiguration, recording_durati
             .segments
             .iter()
             .filter_map(|caption| {
-                let start = to_source(f64::from(caption.start))?;
-                let end = to_source(f64::from(caption.end))?;
+                let start = to_source(caption.start)?;
+                let end = to_source(caption.end)?;
                 let words = caption
                     .words
                     .iter()
                     .filter_map(|word| {
                         Some(CaptionWord {
                             text: word.text.clone(),
-                            start: to_source(f64::from(word.start))?,
-                            end: to_source(f64::from(word.end))?,
+                            start: to_source(word.start)?,
+                            end: to_source(word.end)?,
                         })
                     })
                     .collect();
@@ -419,10 +425,64 @@ pub fn synchronize_captions(project: &mut ProjectConfiguration, recording_durati
         derive_caption_track_segments(&captions.segments, timeline, recording_durations);
 }
 
+/// `reconcileTranscriptCuts` (`captions.ts`): a fresh transcription covers
+/// footage the transcript editor already cut, so words inside
+/// `transcript_removed` go back to being cut words instead of live captions.
+pub fn reconcile_transcript_cuts(captions: &mut CaptionsData) {
+    if captions.transcript_removed.is_empty() {
+        return;
+    }
+    let mut added: Vec<TranscriptCut> = Vec::new();
+    let mut segments = Vec::with_capacity(captions.segments.len());
+    for segment in std::mem::take(&mut captions.segments) {
+        let mut kept = Vec::with_capacity(segment.words.len());
+        for word in &segment.words {
+            let (start, end) = (f64::from(word.start), f64::from(word.end));
+            let midpoint = (start + end) / 2.0;
+            if !captions
+                .transcript_removed
+                .iter()
+                .any(|range| midpoint > range.start && midpoint < range.end)
+            {
+                kept.push(word.clone());
+                continue;
+            }
+            let already_cut = captions.transcript_cuts.iter().chain(&added).any(|cut| {
+                cut.kind == TranscriptCutKind::Word && cut.start < end && start < cut.end
+            });
+            if !already_cut {
+                added.push(TranscriptCut {
+                    id: format!("cut-{}", uuid::Uuid::new_v4()),
+                    kind: TranscriptCutKind::Word,
+                    text: word.text.clone(),
+                    start,
+                    end,
+                    buffer_start: 0.0,
+                    buffer_end: 0.0,
+                    segment_id: Some(segment.id.clone()),
+                    ..Default::default()
+                });
+            }
+        }
+        if kept.len() == segment.words.len() {
+            segments.push(segment);
+        } else if let (Some(first), Some(last)) = (kept.first(), kept.last()) {
+            segments.push(CaptionSegment {
+                id: segment.id.clone(),
+                start: first.start,
+                end: last.end,
+                text: caption_text_from_words(&kept),
+                words: kept,
+            });
+        }
+    }
+    captions.segments = segments;
+    captions.transcript_cuts.extend(added);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::CaptionsData;
 
     fn project(source_timed: bool, start: f32, end: f32) -> ProjectConfiguration {
         ProjectConfiguration {
@@ -467,6 +527,68 @@ mod tests {
     }
 
     #[test]
+    fn legacy_caption_migration_preserves_rounded_timeline_end() {
+        let durations = [41.0 / 15.0, 82.0 / 15.0];
+        for (timescale, hold_duration) in [
+            (1.0, 0.0),
+            (2.0, 0.0),
+            (0.5, 0.0),
+            (1.0, 0.1),
+            (1.0, 10000.1),
+        ] {
+            let mut timeline: TimelineConfiguration = serde_json::from_value(serde_json::json!({
+                "segments": [
+                    {"recordingSegment": 0, "start": 0.0, "end": durations[0], "timescale": timescale},
+                    {"recordingSegment": 1, "start": 0.0, "end": durations[1], "timescale": timescale}
+                ],
+                "transitions": [{"segmentIndex": 1, "type": "cross-fade", "duration": 0.2}],
+                "zoomSegments": []
+            }))
+            .unwrap();
+            if hold_duration > 0.0 {
+                timeline.text_segments.push(
+                    serde_json::from_value(serde_json::json!({
+                        "start": 1.0, "end": 1.0 + hold_duration, "layout": "fullscreen"
+                    }))
+                    .unwrap(),
+                );
+            }
+            let end = timeline.duration() as f32;
+            let mut project = project(false, end - 0.5, end);
+            project.timeline = Some(timeline);
+
+            synchronize_captions(&mut project, &durations);
+
+            let captions = project.captions.as_ref().unwrap();
+            assert_eq!(captions.segments.len(), 1, "{timescale}, {hold_duration}");
+            let source_end = durations.iter().sum::<f64>() as f32;
+            assert_eq!(captions.segments[0].end, source_end);
+            assert_eq!(captions.segments[0].words[0].end, source_end);
+            let track = &project.timeline.as_ref().unwrap().caption_segments;
+            assert_eq!(track.len(), 1);
+            assert!((track[0].end - f64::from(end)).abs() <= f64::from(end * f32::EPSILON));
+            let saved = serde_json::to_string(&project).unwrap();
+            synchronize_captions(&mut project, &durations);
+            assert_eq!(serde_json::to_string(&project).unwrap(), saved);
+        }
+    }
+
+    #[test]
+    fn legacy_caption_migration_rejects_times_beyond_rounded_timeline_end() {
+        let mut project = project(false, 8.0, 9.0_f32.next_up());
+        synchronize_captions(&mut project, &[10.0]);
+        assert!(project.captions.as_ref().unwrap().segments.is_empty());
+        assert!(
+            project
+                .timeline
+                .as_ref()
+                .unwrap()
+                .caption_segments
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn stale_caption_tracks_are_replaced_and_styles_preserved() {
         let mut project = project(true, 8.0, 9.0);
         project.timeline.as_mut().unwrap().caption_segments.push(serde_json::from_value(serde_json::json!({"id":"spoken::edl0","start":100.0,"end":101.0,"text":"hello","colorOverride":"#123456"})).unwrap());
@@ -499,6 +621,58 @@ mod tests {
         assert_eq!(
             project.timeline.as_ref().unwrap().caption_segments[0].end,
             1.0
+        );
+    }
+
+    #[test]
+    fn regenerated_captions_keep_cut_words_cut() {
+        let word = |text: &str, start: f32, end: f32| CaptionWord {
+            text: text.into(),
+            start,
+            end,
+        };
+        let mut captions: CaptionsData = serde_json::from_value(serde_json::json!({
+            "segments": [],
+            "settings": {},
+            "transcriptCuts": [{ "id": "old", "kind": "word", "text": "um", "start": 1.6, "end": 1.9 }],
+            "transcriptRemoved": [{ "start": 1.6, "end": 1.9 }, { "start": 3.0, "end": 3.6 }]
+        }))
+        .unwrap();
+        captions.segments = vec![
+            CaptionSegment {
+                id: "segment-0".into(),
+                start: 1.0,
+                end: 2.5,
+                text: "hello um world".into(),
+                words: vec![
+                    word("hello", 1.0, 1.4),
+                    word("um", 1.6, 1.9),
+                    word("world", 2.0, 2.5),
+                ],
+            },
+            CaptionSegment {
+                id: "segment-1".into(),
+                start: 3.1,
+                end: 3.5,
+                text: "gone".into(),
+                words: vec![word("gone", 3.1, 3.5)],
+            },
+        ];
+
+        reconcile_transcript_cuts(&mut captions);
+
+        assert_eq!(captions.segments.len(), 1);
+        assert_eq!(captions.segments[0].text, "hello world");
+        assert_eq!(captions.segments[0].end, 2.5);
+        let cut_text: Vec<_> = captions
+            .transcript_cuts
+            .iter()
+            .map(|cut| cut.text.as_str())
+            .collect();
+        assert_eq!(cut_text, ["um", "gone"]);
+        assert_eq!(
+            captions.transcript_cuts[1].segment_id.as_deref(),
+            Some("segment-1")
         );
     }
 }
